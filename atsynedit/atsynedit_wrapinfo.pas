@@ -101,6 +101,17 @@ type
     procedure DeleteItems(AFrom, ATo: integer); //remove items [AFrom..ATo], single memory-move
     procedure SpliceItems(AIndex: integer; AItems: TATWrapItems); //insert all AItems at AIndex, single memory-move
     procedure ShiftLineIndexes(AFromItem: integer; ADelta: SizeInt); //Inc(NLineIndex, ADelta) for items [AFromItem..]
+
+    //2026.09 (CudaText perf): fast bulk read of a contiguous range of items,
+    //for API consumers which scan many items (CudaText ed_get_wrapinfo):
+    //replaces N calls of Data[i] (each: bounds checks + property call chain)
+    //with one range clamp + direct memory access. Items are identical to what
+    //Data[AFrom..AFrom+Result-1] returns. Returns the number of items really
+    //written to ADest (0..ACount): for indexes past the end, nothing is
+    //written, caller can zero-fill the tail to mimic Data[] which returns
+    //Default(TATWrapItem) for invalid indexes. ADest must have space for
+    //ACount items
+    function FillItems(AFrom, ACount: integer; ADest: PATWrapItem): integer;
   end;
 
 type
@@ -391,7 +402,7 @@ end;
 
 procedure TATWrapInfo.FindIndexesOfLineNumber(ALineNum: SizeInt; out AFrom, ATo: integer);
 var
-  a, b, m, dif: integer;
+  a, b, m, dif, NCount: integer;
 begin
   if FVirtualMode then
   begin
@@ -423,9 +434,11 @@ begin
 
   AFrom:= m;
   ATo:= m;
+  //2026.09 (CudaText perf): hoist Count out of the loops, it's a function call
+  NCount:= Count;
   while (AFrom>0) and (FList._GetItemPtr(AFrom-1)^.NLineIndex=ALineNum) do
     Dec(AFrom);
-  while (ATo<Count-1) and (FList._GetItemPtr(ATo+1)^.NLineIndex=ALineNum) do
+  while (ATo<NCount-1) and (FList._GetItemPtr(ATo+1)^.NLineIndex=ALineNum) do
     Inc(ATo);
 end;
 
@@ -442,6 +455,47 @@ begin
     if Data[i].NCharIndex + Data[i].NLength > APos.X+1 then // APos.X+1: see CudaText issue 2466
       Break;
   end;
+end;
+
+function TATWrapInfo.FillItems(AFrom, ACount: integer; ADest: PATWrapItem): integer;
+var
+  PStr: PATStringItem;
+  PDest: PATWrapItem;
+  NAvail, i: integer;
+begin
+  Result:= 0;
+  if (AFrom<0) or (ACount<=0) or (ADest=nil) then exit;
+
+  if FVirtualMode then
+  begin
+    //items are synthesized on the fly, exactly like GetData() does,
+    //but the bounds check runs once and line lengths are read by a direct
+    //walk over string items instead of per-item property calls
+    NAvail:= FStrings.Count-AFrom;
+    if NAvail>ACount then
+      NAvail:= ACount;
+    if NAvail<=0 then exit;
+
+    PStr:= FStrings.GetItemPtr(AFrom);
+    PDest:= ADest;
+    for i:= 1 to NAvail do
+    begin
+      PDest^.Init(AFrom+i-1, 1, PStr^.CharLen, 0, TATWrapItemFinal.Final, true);
+      Inc(PStr);
+      Inc(PDest);
+    end;
+  end
+  else
+  begin
+    NAvail:= FList.Count-AFrom;
+    if NAvail>ACount then
+      NAvail:= ACount;
+    if NAvail<=0 then exit;
+
+    System.Move(FList._GetItemPtr(AFrom)^, ADest^, SizeInt(NAvail)*SizeOf(TATWrapItem));
+  end;
+
+  Result:= NAvail;
 end;
 
 procedure TATWrapInfo.SetCapacity(AValue: integer);
